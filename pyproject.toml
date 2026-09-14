@@ -1,0 +1,9 @@
+[project]
+name = "sigma-kernel"
+version = "0.1.0"
+description = "Small persistent LangGraph control plane for n8n"
+requires-python = ">=3.12,<3.13"
+dependencies = ["langgraph", "langgraph-checkpoint-sqlite", "fastapi", "uvicorn"]
+
+[dependency-groups]
+dev = ["httpx"]
