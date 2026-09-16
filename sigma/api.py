@@ -63,6 +63,7 @@ def create_app(db_path=None, token=None):
         pending = [i.value for task in snap.tasks for i in task.interrupts]
         state = snap.values
         return {
+            "job": state["job"],
             "job_id": job_id, "status": state["status"] if pending or not snap.next else "recoverable",
             "current_step": state["step"], "artifacts": state["artifacts"],
             "approval": state["approval"], "error": state["error"],

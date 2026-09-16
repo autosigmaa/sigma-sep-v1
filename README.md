@@ -1,8 +1,9 @@
 # SIGMA Kernel V0
 
 Kernel LangGraph untuk mengatur pekerjaan carousel yang dijalankan oleh n8n.
-Kode Python mengatur progres, checkpoint, dan approval. Panggilan OpenRouter,
-fal.ai, penyimpanan gambar, dan Discord tetap berada di workflow n8n milikmu.
+Kode Python mengatur progres, checkpoint, retry, dan approval. Workflow n8n
+menerima webhook, memanggil persistent Agent yang sudah published, fal.ai,
+penyimpanan gambar, dan Discord, lalu mengirim hasil ke kernel.
 
 ```text
 prepare → create_package → generate_assets → approval → finalize
@@ -80,6 +81,12 @@ Respons penting:
 
 ```json
 {
+  "job": {
+    "job_id": "marlov-001",
+    "brand_id": "marlov",
+    "task_type": "carousel",
+    "input": {"brief": "Perkenalkan brand Marlov tanpa mengarang klaim produk.", "slide_count": 1}
+  },
   "job_id": "marlov-001",
   "created": true,
   "status": "waiting_external",
@@ -93,6 +100,10 @@ Respons penting:
 ```
 
 Respons sebenarnya juga menyertakan `artifacts`, `approval`, dan `error`.
+Semua respons sukses status dan mutasi job menyertakan `job`: identitas, brand,
+task type, dan input asli setelah validasi/default. `created` hanya ada pada
+`POST /jobs`. Field `job` adalah tambahan respons dari data checkpoint yang sudah
+ada; checkpoint `schema_version: 1` tetap kompatibel tanpa migrasi.
 Gunakan `action_id` dari respons, jangan merakitnya sendiri. Simpan juga
 `job_id` di execution n8n. ID yang sama dengan input sama mengembalikan job
 existing dengan `created: false`; input berbeda mendapat HTTP 409.
@@ -103,8 +114,9 @@ Kernel tidak melakukan dispatch atau polling n8n secara otomatis.
 
 ### 2. Kirim paket: `POST /jobs/{job_id}/results`
 
-Carousel Agent di n8n menghasilkan JSON berikut. Kernel memvalidasi kontraknya
-sebelum mengizinkan pembuatan gambar.
+Workflow mengirim brief dan konteks brand ke persistent Agent n8n yang sudah
+published. Agent menghasilkan JSON berikut; workflow meneruskannya sebagai
+hasil action. Kernel memvalidasi kontraknya sebelum mengizinkan pembuatan gambar.
 
 ```json
 {
@@ -165,23 +177,47 @@ dengan brief yang diperbaiki jika hasil ditolak.
 
 ## Workflow n8n yang perlu kamu buat
 
-Satu workflow berurutan cukup:
+Satu workflow penghubung cukup untuk tahap integrasi:
 
-1. **Manual Trigger + Edit Fields**: job ID, brand, brief, jumlah slide.
-2. **HTTP Request → POST /jobs**; **If created** untuk mencegah start duplikat.
-3. **Carousel Agent + OpenRouter**: buat caption, title, body, dan image_prompt
-   per slide; minta jumlah slide tepat dan JSON sesuai kontrak di atas.
-4. **HTTP Request → kirim paket**; gunakan paket tervalidasi dari respons.
-5. **Split Out slides → fal.ai → simpan gambar → Aggregate**: satu gambar
-   lengkap bertulisan per slide. Pertahankan `number` saat menggabungkan hasil.
-6. **HTTP Request → kirim hasil gambar**.
-7. **Discord Send and Wait for Response**, atau mekanisme approval Discord
-   yang tersedia di versimu: kirim preview ke channel review, batasi approver.
-8. **HTTP Request → POST /approval** berdasarkan keputusan manusia.
+1. **Webhook** menerima `job_id` stabil, brand, brief, dan jumlah slide. Pengiriman
+   ulang brief yang sama memakai ID yang sama.
+2. **HTTP Request → POST /jobs**. Jika `created: false`, pulihkan execution/request
+   sebelumnya sebelum memanggil provider lagi.
+3. **Switch `next_action.type`** membaca respons kernel. Model tidak menentukan urutan.
+4. `create_package`: kirim pesan ke **persistent Agent yang published**, dengan
+   session Agent yang dicatat workflow. Minta JSON paket sesuai kontrak di atas.
+   Agent ini entitas tersendiri dengan versi published dan session/memory di n8n;
+   bukan sekadar node AI Agent yang dibuat di dalam workflow.
+5. `generate_assets`: **Split Out slides → fal.ai → storage → Aggregate**. Gunakan
+   `next_action.input.package`, pertahankan nomor slide, lalu kirim hasil batch.
+6. `approval`: workflow Discord menampilkan preview dan menunggu keputusan manusia
+   yang berwenang. Discord dihubungkan lewat workflow; materi persistent Agent
+   yang diberikan tidak mencantumkannya sebagai channel bawaan Agent.
+7. **HTTP Request → /results atau /approval** memakai `action_id` yang diterima,
+   lalu kembali membaca status/action. Berhenti saat menunggu manusia atau terminal.
 
-Respons HTTP kernel adalah checkpoint penghubung antarbagian. Simpan responsnya
-agar node n8n berikutnya memakai action ID yang tepat. Koneksi, credential,
-model, storage, channel, dan kontrol approver disetel di n8n, tanpa mengubah kernel.
+Webhook memulai pekerjaan berdasarkan event; jadwal/manual trigger tidak wajib.
+Kernel menyediakan API yang terus hidup dan mengembalikan action pada respons HTTP.
+Tidak diperlukan dispatcher atau antrean Python.
+
+Simpan hubungan berikut secara persisten di sisi n8n agar execution baru bisa
+melanjutkan pekerjaan setelah terputus:
+
+| Identitas | Pemilik dan fungsi |
+| --- | --- |
+| `job_id` | Kernel: satu pekerjaan dan checkpoint LangGraph |
+| `action_id` | Kernel: satu percobaan langkah; kunci callback dan pelacakan workflow |
+| Agent ID + versi published + session ID | n8n Agent: agent yang digunakan dan percakapan/memory-nya |
+| execution ID | n8n: eksekusi workflow; satu job bisa melintasi beberapa execution |
+| provider request ID | Provider: lacak/pulihkan panggilan seperti fal.ai, per slide |
+| Discord message/review ID | Workflow: temukan approval yang masih menunggu tanpa mengirim ulang |
+
+**Session ID Agent tidak dianggap sama dengan `job_id`.** Simpan ID session aktual
+yang diberikan Agent dan hubungannya ke job. Memory Agent tetap di n8n; checkpoint
+pekerjaan tetap di kernel. Simpan juga payload hasil sebelum callback agar bisa
+dikirim ulang. `job` + `next_action` memulihkan konteks tugas dari kernel, sedangkan
+ID provider/execution memulihkan efek eksternal yang sudah terjadi.
+Koneksi, credential, model, storage, channel, dan kontrol approver disetel di n8n.
 
 ## Error, retry, dan restart
 
@@ -189,6 +225,18 @@ model, storage, channel, dan kontrol approver disetel di n8n, tanpa mengubah ker
 `POST /jobs/{job_id}/resume` melanjutkan langkah internal yang terputus.
 Jika masih menunggu hasil/approval atau job sudah terminal, endpoint ini hanya
 mengembalikan status. Ia tidak melewati approval atau menjalankan provider.
+
+Saat memulihkan execution, baca `GET /jobs/{job_id}` terlebih dahulu:
+
+| Status | Tindakan workflow |
+| --- | --- |
+| `recoverable` | Panggil `/resume`, lalu baca respons baru |
+| `waiting_external` | Pulihkan request/execution lama, lalu jalankan atau selesaikan `next_action` |
+| `waiting_approval` | Gunakan review Discord yang masih menunggu untuk action tersebut |
+| `completed`, `rejected`, `failed` | Berhenti; `/resume` tidak membuka kembali job |
+
+`next_action: null` sendiri bukan bukti selesai: status `recoverable` juga bisa
+memilikinya. Jangan memanggil `/resume` berulang tanpa memeriksa status/error.
 
 Jika n8n memastikan suatu percobaan gagal, kirim:
 
@@ -222,5 +270,9 @@ V0 belum memiliki worker pool, scheduler, auto-recovery n8n, atau database terdi
 
 Suite pengujian mencakup restart setiap tahap, proses mati mendadak, pemulihan
 node internal yang gagal, approval/reject, batas retry, validasi, autentikasi,
-dua callback bersamaan, dan penolakan server kedua. Pengujian memakai data contoh;
+dua callback bersamaan, kompatibilitas checkpoint v1, dan penolakan server kedua.
+[Panduan deployment](DEPLOY.md#uji-http-dan-pemulihan-container-lokal) menyediakan
+uji HTTP dengan dua brand bersamaan dan dua pemulihan container setelah SIGKILL.
+Driver stdlib meniru n8n menggunakan `job` dan `next_action` dari respons.
+Pengujian memakai data contoh;
 belum membuktikan koneksi n8n, kualitas konten, hasil fal.ai, atau pengiriman Discord.

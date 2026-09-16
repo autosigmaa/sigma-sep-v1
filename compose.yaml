@@ -8,7 +8,7 @@ services:
     environment:
       SIGMA_DB_PATH: /data/checkpoints.sqlite
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${SIGMA_PORT:-8000}:8000"
     volumes:
       - kernel_data:/data
     healthcheck:

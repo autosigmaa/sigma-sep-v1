@@ -1,8 +1,8 @@
-# Deploy kernel di VPS menggunakan Docker
+# Deploy dan uji kernel menggunakan Docker/Podman
 
-Paket deploy sudah disiapkan. Konfigurasi Compose dapat divalidasi tanpa server
-Docker; build image dan uji container masih perlu dilakukan di Docker Engine
-yang berjalan. Ini belum berarti kernel sudah di-deploy ke VPS.
+Paket deploy menggunakan Dockerfile dan Compose yang sama untuk Docker atau
+Podman. Pengujian lokal memakai Podman pada Linux arm64; deployment VPS tetap
+harus diperiksa pada mesin tujuan. Ini belum berarti kernel sudah di-deploy ke VPS.
 
 ## Apa yang terpasang di mana?
 
@@ -51,6 +51,12 @@ docker compose ps
 docker compose logs --tail=50 kernel
 curl --fail http://127.0.0.1:8000/health
 ```
+
+Jika muncul `address already in use`, port 8000 sudah dipakai proses lain
+(termasuk kernel Python lokal). Tambahkan `SIGMA_PORT=18000` ke `.env`, lalu
+jalankan kembali `docker compose up -d --build`. Health dan dokumentasi sekarang
+berada di `http://127.0.0.1:18000`. Port di dalam container tetap 8000.
+`SIGMA_PORT` hanya mengatur port host pada Compose, bukan perintah uvicorn lokal.
 
 Hasil health yang diharapkan: `{"status":"ok"}`. Container berjalan sebagai
 user non-root, satu worker. Ia tetap berjalan setelah sesi SSH ditutup.
@@ -108,7 +114,80 @@ secara terpisah di tempat aman. Backup dan pemantauan terjadwal belum dipasang.
 ## Batas implementasi sekarang
 
 Kernel menerima job, hasil, dan approval melalui HTTP; mengatur graph; serta
-mempertahankan checkpoint setelah restart. Kernel **belum mengirim instruksi ke
-webhook n8n secara otomatis**. Memasang container tidak menambahkan fitur tersebut.
-Setelah lingkungan VPS/n8n diketahui, sambungan webhook, pelacakan pengiriman,
-dan workflow Discord dapat dibuat serta diuji bertahap sesuai kontrak README.
+mempertahankan checkpoint setelah restart. **Webhook berada di n8n.** Workflow
+memanggil kernel dan menjalankan `next_action` dari respons, lalu mengirim callback.
+Pembagian ini tidak membutuhkan dispatcher atau antrean di Python. Panduan
+[kontrak workflow](README.md#workflow-n8n-yang-perlu-kamu-buat) menjelaskan hubungan
+job kernel, persistent Agent published/session, execution n8n, dan request provider.
+Koneksi layanan nyata dan deployment VPS belum dibuktikan oleh pengujian lokal.
+
+## Uji HTTP dan pemulihan container lokal
+
+Jalankan dari folder proyek lengkap (termasuk `tests/`) dengan `.env` yang sudah
+berisi token valid. Diperlukan Podman, provider Compose yang mendukung `--wait`,
+Bash, dan curl. Pada macOS, hidupkan VM Podman jika belum berjalan:
+
+```sh
+podman machine start
+podman info
+podman compose version
+bash tests/run_container_smoke.sh podman
+```
+
+Port default pengujian adalah `127.0.0.1:18001`; jika dipakai, jalankan:
+
+```sh
+SIGMA_SMOKE_PORT=18002 bash tests/run_container_smoke.sh podman
+```
+
+Runner membangun image, menunggu container healthy, dan memeriksa `/health` dari
+host. Driver HTTP stdlib di dalam container meniru peran n8n tanpa memanggil
+Agent, fal.ai, storage, atau Discord. Dua job berbeda brand dibuat dan diproses
+bersamaan; semua konten dan URL gambar adalah data contoh.
+
+Runner memakai project unik `sigma-smoke-<timestamp>-<pid>`, image sendiri,
+dan volume `<project>_kernel_data`. Container pengujian memakai `restart: no`
+agar SIGKILL terkontrol. Dua kali container dimatikan paksa lalu diganti dengan
+volume yang sama: setelah paket tersimpan dan setelah gambar tersimpan.
+Driver mengambil status HTTP kembali, memeriksa `job`/`next_action`, mengirim
+ulang callback sebelumnya, lalu melanjutkan sampai terminal.
+
+Pada keberhasilan, output terakhir pengujian berisi:
+
+```text
+PASS: container HTTP scenarios and two forced-kill recoveries
+```
+
+Trap membersihkan container, network, volume, dan tag image khusus tes saat
+runner selesai atau gagal; resource deployment yang sudah ada tidak disentuh.
+Jika runner sendiri terkena SIGKILL atau host mati, trap tidak bisa berjalan.
+Cari nama project tes yang tepat dari output sebelumnya dan bersihkan hanya
+resource miliknya (ganti placeholder, jangan gunakan nama deployment):
+
+```sh
+podman compose -p sigma-smoke-TIMESTAMP-PID -f compose.yaml down --volumes
+podman image rm localhost/sigma-smoke-TIMESTAMP-PID:local
+```
+
+Jangan menjalankan `down --volumes` terhadap deployment yang datanya ingin disimpan.
+Runner juga menerima `docker` sebagai argumen; verifikasi di bawah dilakukan
+menggunakan Podman 5.8.3 pada Linux arm64 melalui VM lokal.
+
+### Hasil verifikasi
+
+- Delapan pengujian kernel lulus, termasuk kompatibilitas checkpoint v1 tanpa migrasi.
+- Build image dan pemeriksaan health lulus; runner HTTP keluar dengan kode 0.
+- Dua job berbeda brand tetap terpisah, sampai `completed` dan `rejected`.
+- Dua SIGKILL dan penggantian container mempertahankan checkpoint serta konteks job.
+- Respons callback sengaja diabaikan untuk meniru respons hilang; pengiriman ulang
+  sebelum/sesudah restart tidak memajukan state dua kali.
+- Callback job lain, hasil tidak valid, approval terlalu awal, dan request tanpa
+  token ditolak tanpa perubahan state.
+- Retry berhenti setelah tiga percobaan; `/resume` tidak membuka kembali job
+  `completed`, `rejected`, maupun `failed`.
+- Container, network, volume, dan tag image tes dibersihkan setelah pengujian.
+
+Ini membuktikan kontrak dan pemulihan kernel pada batas checkpoint. Tidak menguji
+putusnya listrik di tengah disk write, koneksi provider nyata, atau jaminan
+panggilan berbayar hanya sekali. n8n tetap harus memeriksa execution/request
+sebelumnya ketika hasil provider tidak diketahui.

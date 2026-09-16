@@ -29,6 +29,7 @@ class KernelTest(unittest.TestCase):
     def post(self, client, path, payload):
         response = client.post(path, json=payload)
         self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["job"]["job_id"], response.json()["job_id"])
         return response.json()
 
     def result(self, state, data):
@@ -38,6 +39,7 @@ class KernelTest(unittest.TestCase):
         with self.client() as client:
             state = self.post(client, "/jobs", JOB)
             self.assertTrue(state["created"])
+            self.assertEqual(state["job"], {**JOB, "task_type": "carousel"})
             self.assertFalse(self.post(client, "/jobs", JOB)["created"])
             first_action = state["next_action"]
         with self.client() as client:
@@ -48,6 +50,7 @@ class KernelTest(unittest.TestCase):
             self.assertEqual(state["current_step"], "generate_assets")
         with self.client() as client:
             self.assertEqual(client.get(BASE).json(), state)
+
             state = self.post(client, BASE + "/results", self.result(state, ASSETS))
             self.assertEqual(state["status"], "waiting_approval")
         with self.client() as client:
@@ -62,6 +65,19 @@ class KernelTest(unittest.TestCase):
             self.assertEqual(self.post(client, BASE + "/resume", None), state)
         with self.client() as client:
             self.assertEqual(client.get(BASE).json(), state)
+
+    def test_existing_v1_checkpoint_exposes_job_without_migration(self):
+        with self.client() as client:
+            original = {**JOB, "task_type": "carousel"}
+            config = {"configurable": {"thread_id": JOB["job_id"]}}
+            graph = client.app.state.graph
+            graph.invoke({"schema_version": 1, "job": original, "step": "prepare", "status": "running",
+                          "artifacts": {}, "approval": None, "attempts": {}, "error": None, "receipts": {}}, config)
+            before = graph.get_state(config)
+            response = client.get(BASE).json()
+            self.assertEqual(response["job"], original)
+            self.assertEqual(response["next_action"]["input"], original["input"])
+            self.assertEqual(graph.get_state(config).config, before.config)
 
     def test_validation_auth_and_conflicts(self):
         with self.client() as client:
